@@ -29,55 +29,30 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-import shutil
-from pathlib import Path
-from datetime import datetime
-
-def preallocate_vmem(vram=38):
-    required_elements = int(vram * 1024 * 1024 * 1024 / 4)
-    while True:
-        try:
-            occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
-            del occupied
-            break
-        except RuntimeError as e:
-            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            if 'CUDA out of memory' in str(e):
-                free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
-                print(f"*** CUDA OOM: {free_memory / (1024 * 1024)}MiB is free [{t}]")
-            else:
-                print(f"### {e} [{t}]")
-
-preallocate_vmem()
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step, no_report, train_file):
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, step):
     
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     if step==1:
-        # global scene_temp
-        # global gaussians
+        global scene_temp
+        global gaussians
         gaussians= GaussianModel(dataset.sh_degree)
         scene = Scene_1(dataset, gaussians)
         print("start training color pictures")
     if step==2:
-        # scene = Scene_2(dataset, gaussians)
-        # scene.gaussians=scene_temp.gaussians
-        gaussians= GaussianModel(dataset.sh_degree)
         scene = Scene_2(dataset, gaussians)
-        print(f"Load checkpoint {checkpoint}")
-        (model_params, _) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        scene.gaussians=scene_temp.gaussians
         print("start training thermal pictures")
-
-        print(f'Use {train_file}')
-        train_file_path = Path(dataset.source_path) / f"{train_file}"
-        with (train_file_path).open("r", encoding="utf8") as f:
-            train_filenames = [line.strip().rsplit('.', 1)[0] for line in f.read().splitlines() if line.strip()]
-        shutil.copy2(train_file_path, dataset.model_path)
         
     gaussians.training_setup(opt)
+
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -86,14 +61,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
-
-    if not no_report:
-        ema_loss_for_log = 0.0
-        progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-
-    t0 = time.perf_counter()
+    
     for iteration in range(first_iter, opt.iterations + 1):        
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -121,9 +92,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-            if step == 2:
-                viewpoint_stack = [v for v in viewpoint_stack if v.image_name in train_filenames]
-            
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
@@ -151,29 +119,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with torch.no_grad():
             # Progress bar
-            if not no_report:
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                if iteration % 10 == 0:
-                    if step ==1:
-                        progress_bar.set_postfix({"color_Loss": f"{ema_loss_for_log:.{7}f}"})
-                    elif step ==2:
-                        progress_bar.set_postfix({"thermal_Loss": f"{ema_loss_for_log:.{7}f}"})
-                    progress_bar.update(10)
-                if iteration == opt.iterations:
-                    progress_bar.close()
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            if iteration % 10 == 0:
+                if step ==1:
+                    progress_bar.set_postfix({"color_Loss": f"{ema_loss_for_log:.{7}f}"})
+                elif step ==2:
+                    progress_bar.set_postfix({"thermal_Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
 
-                training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),step)
-
+            # Log and save
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),step)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
                 
-                # if iteration == 30000:
-                #     scene_temp=scene
+                if iteration == 30000:
+                    scene_temp=scene
                 
 
             # Densification
-            min_opacity = 0.1
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -181,7 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, min_opacity, scene.cameras_extent, size_threshold)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -194,11 +160,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-    t1 = time.perf_counter()
-
-    print("\nTraining complete.")
-    print(f'{t1 - t0}')
-
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -287,34 +248,25 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--train_file", type=str, default = None)
-    parser.add_argument('--step', type=int, default=1)
-    parser.add_argument("--no_report", action="store_true")
-
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    if args.step == 1:
-        args.checkpoint_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
-    torch.set_num_threads(1)
-
     # Initialize system state (RNG)
-    # safe_state(args.quiet)
+    safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
-    
-    training(lp.extract(args), op.extract(args), pp.extract(args), 
-            args.test_iterations, args.save_iterations, args.checkpoint_iterations, 
-            args.start_checkpoint, args.debug_from,args.step, args.no_report, args.train_file)
-    # print("color training complete,prepare to training thermal pictures")
-    # training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,2)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,1)
+    print("color training complete,prepare to training thermal pictures")
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,2)
+
+    # All done
+    print("\nTraining complete.")

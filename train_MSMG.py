@@ -29,8 +29,28 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+from datetime import datetime
+from pathlib import Path
+import shutil
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def preallocate_vmem(vram=38):
+    required_elements = int(vram * 1024 * 1024 * 1024 / 4)
+    while True:
+        try:
+            occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
+            del occupied
+            break
+        except RuntimeError as e:
+            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if 'CUDA out of memory' in str(e):
+                free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                print(f"*** CUDA OOM: {free_memory / (1024 * 1024)}MiB is free [{t}]")
+            else:
+                print(f"### {e} [{t}]")
+
+preallocate_vmem()
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, train_file, no_report):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians_1 = GaussianModel(dataset.sh_degree)
@@ -44,6 +64,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians_1.restore(model_params, opt)
         gaussians_2.restore(model_params, opt)
+    
+    if train_file is not None:
+        print(f'Use {train_file}')
+        train_file_path = Path(dataset.source_path) / f"{train_file}"
+        with (train_file_path).open("r", encoding="utf8") as f:
+            train_filenames = [line.strip().rsplit('.', 1)[0] for line in f.read().splitlines() if line.strip()]
+        shutil.copy2(train_file_path, dataset.model_path)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -53,30 +80,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     viewpoint_stack_1 = None
     viewpoint_stack_2 = None
-    ema_loss_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    if not no_report:
+        ema_loss_for_log = 0.0
+        progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+
     first_iter += 1
 
+    t0 = time.perf_counter()
     for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes_1 = None
-                net_image_bytes_2 = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image_1 = render(custom_cam, gaussians_1, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes_1 = memoryview((torch.clamp(net_image_1, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                    net_image_2 = render(custom_cam, gaussians_1, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes_2 = memoryview((torch.clamp(net_image_2, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes_1, dataset.source_path)
-                network_gui.send(net_image_bytes_2, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        # if network_gui.conn == None:
+        #     network_gui.try_connect()
+        # while network_gui.conn != None:
+        #     try:
+        #         net_image_bytes_1 = None
+        #         net_image_bytes_2 = None
+        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+        #         if custom_cam != None:
+        #             net_image_1 = render(custom_cam, gaussians_1, pipe, background, scaling_modifer)["render"]
+        #             net_image_bytes_1 = memoryview((torch.clamp(net_image_1, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+        #             net_image_2 = render(custom_cam, gaussians_1, pipe, background, scaling_modifer)["render"]
+        #             net_image_bytes_2 = memoryview((torch.clamp(net_image_2, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+        #         network_gui.send(net_image_bytes_1, dataset.source_path)
+        #         network_gui.send(net_image_bytes_2, dataset.source_path)
+        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+        #             break
+        #     except Exception as e:
+        #         network_gui.conn = None
 
         iter_start.record()
 
@@ -90,12 +120,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack_1:
-
             viewpoint_stack_1 = scene_1.getTrainCameras().copy()
         viewpoint_cam_1 = viewpoint_stack_1.pop(randint(0, len(viewpoint_stack_1)-1))    
         if not viewpoint_stack_2:
-
             viewpoint_stack_2 = scene_2.getTrainCameras().copy()
+            viewpoint_stack_2 = [v for v in viewpoint_stack_2 if v.image_name in train_filenames]
         viewpoint_cam_2 = viewpoint_stack_2.pop(randint(0, len(viewpoint_stack_2)-1))
         
 
@@ -116,7 +145,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image_1 = viewpoint_cam_1.original_image.cuda()
         Ll1_1 = l1_loss(image_1, gt_image_1)
         loss_1 = (1.0 - opt.lambda_dssim) * Ll1_1 + opt.lambda_dssim * (1.0 - ssim(image_1, gt_image_1))
-        
+
         gt_image_2 = viewpoint_cam_2.original_image.cuda()
         Ll1_2 = l1_loss(image_2, gt_image_2)
 
@@ -132,17 +161,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * total_loss.item() + 0.6 * ema_loss_for_log
-
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            # Log and save
-            training_report(tb_writer, iteration, Ll1_1 , total_loss ,Ll1_2, total_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene_1,scene_2, render, (pipe, background))
+            if not no_report:
+                ema_loss_for_log = 0.4 * total_loss.item() + 0.6 * ema_loss_for_log
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
+                training_report(tb_writer, iteration, Ll1_1 , total_loss ,Ll1_2, total_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene_1,scene_2, render, (pipe, background))
+            
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene_1.save(iteration)
@@ -176,6 +203,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians_1.capture(), iteration), scene_1.model_path + "/chkpnt_1" + str(iteration) + ".pth")
                 torch.save((gaussians_2.capture(), iteration), scene_2.model_path + "/chkpnt_2" + str(iteration) + ".pth")
+    t1 = time.perf_counter()
+
+    print("\nTraining complete.")
+    print(f'{t1 - t0}')
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -291,23 +322,25 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--train_file", type=str, default = None)
+    parser.add_argument("--no_report", action="store_true")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
+    torch.set_num_threads(1)
+
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    # safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
-
-    # All done
-    print("\nTraining complete.")
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, 
+            args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.train_file, args.no_report)

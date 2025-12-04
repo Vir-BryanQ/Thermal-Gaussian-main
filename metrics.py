@@ -20,26 +20,56 @@ import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
+from pytorch_msssim import SSIM
+from torchmetrics.image import PeakSignalNoiseRatio
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-def readImages(renders_dir, gt_dir):
+from datetime import datetime
+
+def preallocate_vmem(vram=38):
+    required_elements = int(vram * 1024 * 1024 * 1024 / 4)
+    while True:
+        try:
+            occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
+            del occupied
+            break
+        except RuntimeError as e:
+            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if 'CUDA out of memory' in str(e):
+                free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                print(f"*** CUDA OOM: {free_memory / (1024 * 1024)}MiB is free [{t}]")
+            else:
+                print(f"### {e} [{t}]")
+
+preallocate_vmem()
+
+def readImages(renders_dir, gt_dir, ns_metric):
     renders = []
     gts = []
     image_names = []
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        if ns_metric:
+            renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :])
+            gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :])
+        else:
+            renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
+            gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
         image_names.append(fname)
     return renders, gts, image_names
 
-def evaluate(model_paths):
+def evaluate(model_paths, args):
 
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
     print("")
+
+    psnr1 = PeakSignalNoiseRatio(data_range=1.0)
+    ssim1 = SSIM(data_range=1.0, size_average=True, channel=3)
+    lpips1 = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
     for scene_dir in model_paths:
         try:
@@ -66,16 +96,21 @@ def evaluate(model_paths):
 
                 color_gt_dir = method_dir/ "gt"
                 color_renders_dir = method_dir / "renders"
-                color_renders, color_gts, image_names = readImages(color_renders_dir, color_gt_dir)
+                color_renders, color_gts, image_names = readImages(color_renders_dir, color_gt_dir, args.ns_metric)
 
                 color_ssims = []
                 color_psnrs = []
                 color_lpipss = []
 
                 for idx in tqdm(range(len(color_renders)), desc="Metric evaluation progress"):
-                    color_ssims.append(ssim(color_renders[idx], color_gts[idx]))
-                    color_psnrs.append(psnr(color_renders[idx], color_gts[idx]))
-                    color_lpipss.append(lpips(color_renders[idx], color_gts[idx], net_type='vgg'))
+                    if args.ns_metric:
+                        color_ssims.append(float(ssim1(color_renders[idx], color_gts[idx]).item()))
+                        color_psnrs.append(float(psnr1(color_renders[idx], color_gts[idx])))
+                        color_lpipss.append(float(lpips1(color_renders[idx], color_gts[idx])))
+                    else:
+                        color_ssims.append(ssim(color_renders[idx], color_gts[idx]))
+                        color_psnrs.append(psnr(color_renders[idx], color_gts[idx]))
+                        color_lpipss.append(lpips(color_renders[idx], color_gts[idx], net_type='vgg'))
 
                 print(" color SSIM : {:>12.7f}".format(torch.tensor(color_ssims).mean(), ".5"))
                 print(" color PSNR : {:>12.7f}".format(torch.tensor(color_psnrs).mean(), ".5"))
@@ -101,17 +136,21 @@ def evaluate(model_paths):
 
                 thermal_gt_dir = method_dir/ "gt"
                 thermal_renders_dir = method_dir / "renders"
-                thermal_renders, thermal_gts, image_names = readImages(thermal_renders_dir, thermal_gt_dir)
+                thermal_renders, thermal_gts, image_names = readImages(thermal_renders_dir, thermal_gt_dir, args.ns_metric)
 
                 thermal_ssims = []
                 thermal_psnrs = []
                 thermal_lpipss = []
 
                 for idx in tqdm(range(len(color_renders)), desc="Metric evaluation progress"):
-
-                    thermal_ssims.append(ssim(thermal_renders[idx], thermal_gts[idx]))
-                    thermal_psnrs.append(psnr(thermal_renders[idx], thermal_gts[idx]))
-                    thermal_lpipss.append(lpips(thermal_renders[idx], thermal_gts[idx], net_type='vgg'))
+                    if args.ns_metric:
+                        thermal_ssims.append(float(ssim1(thermal_renders[idx], thermal_gts[idx]).item()))
+                        thermal_psnrs.append(float(psnr1(thermal_renders[idx], thermal_gts[idx])))
+                        thermal_lpipss.append(float(lpips1(thermal_renders[idx], thermal_gts[idx])))
+                    else:
+                        thermal_ssims.append(ssim(thermal_renders[idx], thermal_gts[idx]))
+                        thermal_psnrs.append(psnr(thermal_renders[idx], thermal_gts[idx]))
+                        thermal_lpipss.append(lpips(thermal_renders[idx], thermal_gts[idx], net_type='vgg'))
 
                 print(" thermal SSIM : {:>12.7f}".format(torch.tensor(thermal_ssims).mean(), ".5"))
                 print(" thermal PSNR : {:>12.7f}".format(torch.tensor(thermal_psnrs).mean(), ".5"))
@@ -134,7 +173,8 @@ def evaluate(model_paths):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception as e:
+            print(e)
             print("Unable to compute metrics for model", scene_dir)
 
 if __name__ == "__main__":
@@ -144,5 +184,6 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument("--ns_metric", action="store_true")
     args = parser.parse_args()
-    evaluate(args.model_paths)
+    evaluate(args.model_paths, args)

@@ -21,6 +21,24 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 import time
+from datetime import datetime
+
+def preallocate_vmem(vram=38):
+    required_elements = int(vram * 1024 * 1024 * 1024 / 4)
+    while True:
+        try:
+            occupied = torch.empty(required_elements , dtype=torch.float32, device='cuda')
+            del occupied
+            break
+        except RuntimeError as e:
+            t = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            if 'CUDA out of memory' in str(e):
+                free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                print(f"*** CUDA OOM: {free_memory / (1024 * 1024)}MiB is free [{t}]")
+            else:
+                print(f"### {e} [{t}]")
+
+preallocate_vmem()
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
 
